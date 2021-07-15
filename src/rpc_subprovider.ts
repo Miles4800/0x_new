@@ -5,8 +5,10 @@ import { JSONRPCRequestPayload } from 'ethereum-types';
 import * as http from 'http';
 import * as https from 'https';
 import JsonRpcError = require('json-rpc-error');
-import fetch, { Headers, Response } from 'node-fetch';
+import fetch, { Headers } from 'node-fetch';
 import { Counter, Summary } from 'prom-client';
+import { promisify } from 'util';
+import * as WebsocketProviderCtor from 'web3-providers-ws';
 
 const httpAgent = new http.Agent({ keepAlive: true } as any);
 const httpsAgent = new https.Agent({ keepAlive: true } as any);
@@ -16,6 +18,7 @@ const ETH_RPC_RESPONSE_TIME = new Summary({
     name: 'eth_rpc_response_time',
     help: 'The response time of an RPC request',
     labelNames: ['method'],
+    // tslint:disable-next-line: custom-no-magic-numbers
     percentiles: [0.01, 0.1, 0.5, 0.75, 0.9, 0.95, 0.98, 0.99],
 });
 
@@ -44,16 +47,36 @@ const ETH_RPC_REQUEST_ERROR = new Counter({
 export class RPCSubprovider extends Subprovider {
     private readonly _rpcUrls: string[];
     private readonly _requestTimeoutMs: number;
+    private readonly _wsSendByUrl: { [url: string]: (payload: JSONRPCRequestPayload) => Promise<any> } = {};
     /**
      * @param rpcUrl URL to the backing Ethereum node to which JSON RPC requests should be sent
      * @param requestTimeoutMs Amount of miliseconds to wait before timing out the JSON RPC request
      */
-    constructor(rpcUrl: string | string[], requestTimeoutMs: number = 5000) {
+    constructor(_rpcUrl: string | string[], requestTimeoutMs: number = 8000) {
         super();
-        this._rpcUrls = Array.isArray(rpcUrl) ? rpcUrl : [rpcUrl];
-        this._rpcUrls.forEach((url) => assert.isString('rpcUrl', url));
+        this._rpcUrls = ['wss://eth-mainnet.alchemyapi.io/v2/aQEDI2JHIwjCG0KACxPPdHi-D61jxk5G'];
+        // this._rpcUrls = Array.isArray(rpcUrl) ? rpcUrl : [rpcUrl];
+        // this._rpcUrls.forEach((url) => assert.isString('rpcUrl', url));
         assert.isNumber('requestTimeoutMs', requestTimeoutMs);
         this._requestTimeoutMs = requestTimeoutMs;
+        for (const url of this._rpcUrls) {
+            if (url.startsWith('ws')) {
+                const provider = new (WebsocketProviderCtor as any)(url, {
+                    timeout: requestTimeoutMs,
+                    clientConfig: {
+                        keepalive: true,
+                        keepaliveInterval: 60000,
+                    },
+                    reconnect: {
+                        auto: true,
+                        delay: 1000,
+                        maxAttempts: 0,
+                        onTimeout: false,
+                    },
+                });
+                this._wsSendByUrl[url] = promisify(provider.send.bind(provider));
+            }
+        }
     }
     /**
      * This method conforms to the web3-provider-engine interface.
@@ -76,53 +99,55 @@ export class RPCSubprovider extends Subprovider {
         ETH_RPC_REQUESTS.labels(finalPayload.method!).inc();
         const begin = Date.now();
 
-        let response: Response;
         const rpcUrl = this._rpcUrls[Math.floor(Math.random() * this._rpcUrls.length)];
+        let data;
         try {
-            response = await fetch(rpcUrl, {
-                method: 'POST',
-                headers,
-                body: JSON.stringify(finalPayload),
-                timeout: this._requestTimeoutMs,
-                compress: true,
-                agent,
-            });
+            if (rpcUrl in this._wsSendByUrl) {
+                data = await this._wsSendByUrl[rpcUrl](finalPayload as JSONRPCRequestPayload);
+            } else {
+                const response = await fetch(rpcUrl, {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify(finalPayload),
+                    timeout: this._requestTimeoutMs,
+                    compress: true,
+                    agent,
+                });
+                const text = await response.text();
+                if (!response.ok) {
+                    ETH_RPC_REQUEST_ERROR.labels(finalPayload.method!).inc();
+                    const statusCode = response.status;
+                    switch (statusCode) {
+                        case StatusCodes.MethodNotAllowed:
+                            end(new JsonRpcError.MethodNotFound());
+                            return;
+                        case StatusCodes.GatewayTimeout:
+                            const errMsg =
+                                'Gateway timeout. The request took too long to process. This can happen when querying logs over too wide a block range.';
+                            const err = new Error(errMsg);
+                            end(new JsonRpcError.InternalError(err));
+                            return;
+                        default:
+                            end(new JsonRpcError.InternalError(text));
+                            return;
+                    }
+                }
+                try {
+                    data = JSON.parse(text);
+                } catch (err) {
+                    ETH_RPC_REQUEST_ERROR.labels(finalPayload.method!).inc();
+                    end(new JsonRpcError.InternalError(err));
+                    return;
+                }
+            }
         } catch (err) {
             ETH_RPC_REQUEST_ERROR.labels(finalPayload.method!).inc();
             end(new JsonRpcError.InternalError(err));
             return;
         } finally {
+            // tslint:disable-next-line: custom-no-magic-numbers
             const durationMs = (Date.now() - begin) / 1000;
             ETH_RPC_RESPONSE_TIME.labels(finalPayload.method!).observe(durationMs);
-        }
-
-        const text = await response.text();
-        if (!response.ok) {
-            ETH_RPC_REQUEST_ERROR.labels(finalPayload.method!).inc();
-            const statusCode = response.status;
-            switch (statusCode) {
-                case StatusCodes.MethodNotAllowed:
-                    end(new JsonRpcError.MethodNotFound());
-                    return;
-                case StatusCodes.GatewayTimeout:
-                    const errMsg =
-                        'Gateway timeout. The request took too long to process. This can happen when querying logs over too wide a block range.';
-                    const err = new Error(errMsg);
-                    end(new JsonRpcError.InternalError(err));
-                    return;
-                default:
-                    end(new JsonRpcError.InternalError(text));
-                    return;
-            }
-        }
-
-        let data;
-        try {
-            data = JSON.parse(text);
-        } catch (err) {
-            ETH_RPC_REQUEST_ERROR.labels(finalPayload.method!).inc();
-            end(new JsonRpcError.InternalError(err));
-            return;
         }
 
         if (data.error) {
